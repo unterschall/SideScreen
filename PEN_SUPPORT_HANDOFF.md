@@ -122,6 +122,20 @@ End-to-end (USB-C, lowest latency for drawing):
 5. Backward-compat: new client against an **unmodified/old host** build must
    silently fall back to touch with no desync.
 
+**Device test done (2026-07-24), Lenovo TB361FU tablet + USB-C, Android 16:**
+- (a) pressure — **PASS**, stroke width tracks pressure in Affinity.
+- (b) tilt — **PASS**, tilt-aware brush responds correctly.
+- (c) barrel button — **untested**, this stylus has no barrel button.
+- (d) eraser tip — **untested**, this stylus has no eraser tip.
+- (e) palm rejection — **PASS**, resting a palm mid-stroke produced no stray
+  marks and didn't interrupt the ongoing stylus stroke.
+- (5) backward-compat — **PASS**. Built the pre-pen-support commit (`a651a81`)
+  in a separate worktree, ran it in place of the new host, reconnected the new
+  client: clean reconnect, no desync, finger touch worked normally.
+
+Barrel button and eraser remain unverified against real hardware — revisit
+with a stylus that has them before calling this fully done.
+
 ---
 
 ## Known caveats & TODO (pick up here)
