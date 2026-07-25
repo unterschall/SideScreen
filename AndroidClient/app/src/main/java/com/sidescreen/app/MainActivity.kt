@@ -40,6 +40,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.net.InetSocketAddress
 import java.net.Socket
+import kotlin.math.cos
+import kotlin.math.sin
 
 private fun mainDiag(msg: String) = DiagLog.log("MA", msg)
 
@@ -59,6 +61,14 @@ class MainActivity : AppCompatActivity() {
     private var displayRotation = 0 // 0, 90, 180, 270 degrees
     private var displayFlipHorizontal = false
     private var displayFlipVertical = false
+    // True between a stylus down and up — drives palm rejection (finger input
+    // is dropped while a stylus stroke is active).
+    private var stylusActive = false
+    // True between a finger ACTION_DOWN and its bracket-ending ACTION_UP/
+    // ACTION_CANCEL. Lets routeInput notice a finger gesture that was already
+    // open when a stylus pointer appears, so it can be closed out cleanly
+    // instead of orphaned (see endOrphanedFingerGesture).
+    private var fingerActive = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var pingJob: kotlinx.coroutines.Job? = null
 
@@ -355,14 +365,79 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.surfaceView.setOnTouchListener { view, event ->
-            handleTouch(view, event)
+            routeInput(view, event)
             true
         }
         binding.textureView.setOnTouchListener { view, event ->
-            handleTouch(view, event)
+            routeInput(view, event)
+            true
+        }
+        // Hover events (stylus in proximity but not touching) arrive here, not
+        // through the touch listener. Used to drive pen proximity on the Mac.
+        binding.surfaceView.setOnHoverListener { view, event ->
+            handleHover(view, event)
+            true
+        }
+        binding.textureView.setOnHoverListener { view, event ->
+            handleHover(view, event)
             true
         }
     }
+
+    /**
+     * Split incoming pointer events into the pen path (pressure-sensitive
+     * stylus, when the host enabled it) and the existing finger touch path.
+     * While a stylus stroke is in progress, finger events are dropped for palm
+     * rejection.
+     */
+    private fun routeInput(
+        view: View,
+        event: MotionEvent,
+    ) {
+        if (streamClient?.penEnabled == true) {
+            val stylusIdx = stylusPointerIndex(event)
+            if (stylusIdx != null) {
+                if (fingerActive) endOrphanedFingerGesture(view, event, stylusIdx)
+                handleStylus(view, event, stylusIdx)
+                return
+            }
+            if (stylusActive) {
+                // A stylus stroke owns the surface — ignore finger/palm input.
+                return
+            }
+        }
+        handleTouch(view, event)
+    }
+
+    /**
+     * A stylus pointer just appeared while a finger gesture was already open.
+     * Once routeInput switches to the stylus path, the finger's own UP would
+     * never reach [handleTouch] again — closing it out here with a synthetic
+     * UP keeps the host's touch gesture state machine from getting stuck
+     * (e.g. a long-press-drag left holding a synthetic mouse button down).
+     */
+    private fun endOrphanedFingerGesture(
+        view: View,
+        event: MotionEvent,
+        stylusIdx: Int,
+    ) {
+        val fingerIdx = (0 until event.pointerCount).firstOrNull { it != stylusIdx }
+        if (fingerIdx != null) {
+            val rawX = event.getX(fingerIdx) / view.width.toFloat()
+            val rawY = event.getY(fingerIdx) / view.height.toFloat()
+            val x = if (displayFlipHorizontal) 1f - rawX else rawX
+            val y = if (displayFlipVertical) 1f - rawY else rawY
+            streamClient?.sendTouch(x, y, 2, 1)
+        }
+        inputPredictor.reset()
+        fingerActive = false
+    }
+
+    private fun stylusPointerIndex(event: MotionEvent): Int? =
+        (0 until event.pointerCount).firstOrNull {
+            val tool = event.getToolType(it)
+            tool == MotionEvent.TOOL_TYPE_STYLUS || tool == MotionEvent.TOOL_TYPE_ERASER
+        }
 
     private fun setupUI() {
         binding.connectButton.setOnClickListener {
@@ -1363,6 +1438,7 @@ class MainActivity : AppCompatActivity() {
 
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                fingerActive = true
                 inputPredictor.reset()
                 inputPredictor.addSample(x, y)
                 streamClient?.sendTouch(x, y, 0, pointerCount, x2, y2)
@@ -1383,6 +1459,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             MotionEvent.ACTION_UP -> {
+                fingerActive = false
                 inputPredictor.reset()
                 streamClient?.sendTouch(x, y, 2, 1)
             }
@@ -1392,10 +1469,110 @@ class MainActivity : AppCompatActivity() {
             }
 
             MotionEvent.ACTION_CANCEL -> {
+                fingerActive = false
                 inputPredictor.reset()
                 streamClient?.sendTouch(x, y, 2, 1)
             }
         }
+    }
+
+    // Pen action codes on the wire (must match the Mac host).
+    private val penDown = 0
+    private val penMove = 1
+    private val penUp = 2
+    private val penHoverMove = 3
+    private val penHoverEnter = 4
+    private val penHoverExit = 5
+
+    /**
+     * Send a pressure-sensitive stylus sample for the given pointer. Bypasses
+     * [InputPredictor] on purpose — prediction distorts the pressure/position
+     * relationship a drawing app relies on.
+     */
+    private fun handleStylus(
+        view: View,
+        event: MotionEvent,
+        pointerIndex: Int,
+    ) {
+        // Only the stylus pointer going up/down starts or ends the stroke; a
+        // finger or palm changing state (with the stylus still down) is just a
+        // move for the pen.
+        val changedIsStylus = event.actionIndex == pointerIndex
+        val action =
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    stylusActive = true
+                    penDown
+                }
+                MotionEvent.ACTION_POINTER_DOWN ->
+                    if (changedIsStylus) {
+                        stylusActive = true
+                        penDown
+                    } else {
+                        penMove
+                    }
+                MotionEvent.ACTION_MOVE -> penMove
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    stylusActive = false
+                    penUp
+                }
+                MotionEvent.ACTION_POINTER_UP ->
+                    if (changedIsStylus) {
+                        stylusActive = false
+                        penUp
+                    } else {
+                        penMove
+                    }
+                else -> return
+            }
+        sendPenSample(view, event, pointerIndex, action)
+    }
+
+    private fun handleHover(
+        view: View,
+        event: MotionEvent,
+    ) {
+        if (streamClient?.penEnabled != true) return
+        val pointerIndex = stylusPointerIndex(event) ?: return
+        val action =
+            when (event.actionMasked) {
+                MotionEvent.ACTION_HOVER_ENTER -> penHoverEnter
+                MotionEvent.ACTION_HOVER_MOVE -> penHoverMove
+                MotionEvent.ACTION_HOVER_EXIT -> penHoverExit
+                else -> return
+            }
+        sendPenSample(view, event, pointerIndex, action)
+    }
+
+    private fun sendPenSample(
+        view: View,
+        event: MotionEvent,
+        pointerIndex: Int,
+        action: Int,
+    ) {
+        val rawX = event.getX(pointerIndex) / view.width.toFloat()
+        val rawY = event.getY(pointerIndex) / view.height.toFloat()
+        val x = if (displayFlipHorizontal) 1f - rawX else rawX
+        val y = if (displayFlipVertical) 1f - rawY else rawY
+
+        val pressure = event.getPressure(pointerIndex).coerceIn(0f, 1f)
+
+        // Android tilt is the angle from perpendicular (0..π/2); orientation is
+        // the direction of lean. Convert to the Mac's -1..1 tiltX/tiltY. This
+        // is an approximation — refine against a real pen if brushes look off.
+        val tilt = event.getAxisValue(MotionEvent.AXIS_TILT, pointerIndex)
+        val orientation = event.getAxisValue(MotionEvent.AXIS_ORIENTATION, pointerIndex)
+        val tiltFrac = (tilt / (Math.PI.toFloat() / 2f)).coerceIn(0f, 1f)
+        val tiltX = sin(orientation) * tiltFrac
+        val tiltY = -cos(orientation) * tiltFrac
+
+        var flags = 0
+        if (event.getToolType(pointerIndex) == MotionEvent.TOOL_TYPE_ERASER) flags = flags or 0x1
+        val buttons = event.buttonState
+        if (buttons and MotionEvent.BUTTON_STYLUS_PRIMARY != 0) flags = flags or 0x2
+        if (buttons and MotionEvent.BUTTON_STYLUS_SECONDARY != 0) flags = flags or 0x4
+
+        streamClient?.sendPen(x, y, pressure, tiltX, tiltY, flags, action)
     }
 
     private fun applyRotation(

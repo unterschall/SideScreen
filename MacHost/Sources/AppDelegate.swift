@@ -244,6 +244,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
+        // Observer for pen/pressure enable/disable. Note: the client only
+        // learns pen support at connect time (via the type-14 advertisement),
+        // so toggling this mid-session only affects whether arriving pen frames
+        // are dispatched; a reconnect is needed for the client to start/stop
+        // emitting them.
+        settings.$penEnabled
+            .dropFirst()
+            .sink { [weak self] enabled in
+                self?.streamingServer?.penEnabled = enabled
+            }
+            .store(in: &cancellables)
+
         // Observer cho connection mode changes — restart server with new auth/ADB policy.
         settings.$connectionMode
             .dropFirst()
@@ -587,6 +599,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Setup server
             streamingServer = StreamingServer(port: settings.port)
             streamingServer?.touchEnabled = settings.touchEnabled
+            streamingServer?.penEnabled = settings.penEnabled
             if settings.connectionMode == .wireless {
                 streamingServer?.expectedAuthToken = WirelessAuth.loadOrCreate()
                 streamingServer?.onWirelessClientPaired = { [weak self] deviceName in
@@ -633,6 +646,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             streamingServer?.onClientDisconnected = { [weak self] in
                 guard let self = self else { return }
+                self.resetPenState()
                 Task { @MainActor in
                     self.settings.clientConnected = false
                     // Final lastConnected snapshot at the disconnect moment, then
@@ -648,6 +662,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             streamingServer?.onTouchEvent = { [weak self] x, y, action, pointerCount, x2, y2 in
                 self?.handleTouch(x: x, y: y, action: action, pointerCount: pointerCount, x2: x2, y2: y2)
+            }
+
+            streamingServer?.onPenEvent = { [weak self] x, y, pressure, tiltX, tiltY, flags, action in
+                self?.handlePen(x: x, y: y, pressure: pressure, tiltX: tiltX, tiltY: tiltY, flags: flags, action: action)
             }
 
             streamingServer?.onStats = { [weak self] fps, mbps in
@@ -1026,6 +1044,134 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let event = CGEvent(mouseEventSource: eventSource, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) {
             event.post(tap: .cghidEventTap)
         }
+    }
+
+    // MARK: - Pen / Stylus Injection
+    //
+    // Unlike finger touches, pen events bypass the gesture state machine
+    // entirely and are synthesized as tablet events so pressure-aware apps see
+    // NSEvent.pressure. Wire action codes: 0=down 1=move 2=up 3=hover-move
+    // 4=hover-enter 5=hover-exit. flags bits: 0=eraser 1=barrel-primary
+    // 2=barrel-secondary.
+
+    private var penInProximity = false
+    private var penIsDown = false
+    // Button used for the current stroke, captured at down (barrel-primary maps
+    // to right-click, the standard Wacom default). Held for the whole stroke so
+    // a mid-stroke button change doesn't split it across event types.
+    private var penButton: CGMouseButton = .left
+    // Last point any pen event was posted at, used only to give resetPenState()
+    // a sane location for its synthesized cleanup events.
+    private var lastPenPoint: CGPoint = .zero
+
+    /// Closes out any open stroke/proximity session without waiting for a
+    /// wire event — call this on client disconnect. Otherwise a dropped
+    /// connection mid-stroke leaves a real synthesized mouse-button-down (or
+    /// tablet proximity) stuck on macOS with nothing left to end it.
+    func resetPenState() {
+        guard penIsDown || penInProximity else { return }
+        if penIsDown {
+            penPost(penButton == .right ? .rightMouseUp : .leftMouseUp,
+                    at: lastPenPoint, button: penButton, pressure: 0, tiltX: 0, tiltY: 0)
+            penIsDown = false
+        }
+        if penInProximity {
+            penProximity(entering: false, at: lastPenPoint, eraser: false)
+        }
+    }
+
+    func handlePen(x: Float, y: Float, pressure: Float, tiltX: Float, tiltY: Float, flags: Int, action: Int) {
+        // If the setting was toggled off mid-stroke, still let the up/hover-exit
+        // through when a stroke or proximity session is open so it can close
+        // out cleanly (see penProximity/penIsDown below) — otherwise a real
+        // synthesized mouse-button-down is left stuck on macOS.
+        let isEndingAction = action == 2 || action == 5 // up, hover-exit
+        guard settings.penEnabled || (isEndingAction && (penIsDown || penInProximity)) else { return }
+
+        if !AXIsProcessTrusted() {
+            if !accessibilityWarningShown {
+                accessibilityWarningShown = true
+                print("⚠️  Accessibility not granted - pen ignored")
+                Task { @MainActor in
+                    settings.hasAccessibilityPermission = false
+                }
+            }
+            return
+        }
+
+        guard let displayID = virtualDisplayManager?.displayID else { return }
+        let bounds = CGDisplayBounds(displayID)
+        let point = CGPoint(
+            x: bounds.origin.x + CGFloat(x) * bounds.width,
+            y: bounds.origin.y + CGFloat(y) * bounds.height
+        )
+        lastPenPoint = point
+
+        let isEraser = (flags & 0x1) != 0
+        let barrelPrimary = (flags & 0x2) != 0
+        let p = max(0, min(1, pressure))
+
+        switch action {
+        case 4: // hover-enter
+            penProximity(entering: true, at: point, eraser: isEraser)
+        case 3: // hover-move (in proximity, not touching)
+            if !penInProximity { penProximity(entering: true, at: point, eraser: isEraser) }
+            penPost(.mouseMoved, at: point, button: .left, pressure: 0, tiltX: tiltX, tiltY: tiltY)
+        case 0: // down
+            if !penInProximity { penProximity(entering: true, at: point, eraser: isEraser) }
+            penButton = barrelPrimary ? .right : .left
+            penIsDown = true
+            penPost(penButton == .right ? .rightMouseDown : .leftMouseDown,
+                    at: point, button: penButton, pressure: p, tiltX: tiltX, tiltY: tiltY)
+        case 1: // move (in contact)
+            if penIsDown {
+                penPost(penButton == .right ? .rightMouseDragged : .leftMouseDragged,
+                        at: point, button: penButton, pressure: p, tiltX: tiltX, tiltY: tiltY)
+            } else {
+                penPost(.mouseMoved, at: point, button: .left, pressure: 0, tiltX: tiltX, tiltY: tiltY)
+            }
+        case 2: // up
+            if penIsDown {
+                penPost(penButton == .right ? .rightMouseUp : .leftMouseUp,
+                        at: point, button: penButton, pressure: 0, tiltX: tiltX, tiltY: tiltY)
+                penIsDown = false
+            }
+        case 5: // hover-exit
+            if penIsDown {
+                penPost(penButton == .right ? .rightMouseUp : .leftMouseUp,
+                        at: point, button: penButton, pressure: 0, tiltX: tiltX, tiltY: tiltY)
+                penIsDown = false
+            }
+            penProximity(entering: false, at: point, eraser: isEraser)
+        default:
+            break
+        }
+    }
+
+    private func penProximity(entering: Bool, at point: CGPoint, eraser: Bool) {
+        guard let e = CGEvent(mouseEventSource: eventSource, mouseType: .mouseMoved,
+                              mouseCursorPosition: point, mouseButton: .left) else { return }
+        e.setIntegerValueField(.mouseEventSubtype, value: Int64(NSEvent.EventSubtype.tabletProximity.rawValue))
+        e.setIntegerValueField(.tabletProximityEventEnterProximity, value: entering ? 1 : 0)
+        // Pointer type: 1 = pen tip, 3 = eraser. Apps that support an eraser
+        // switch tools when they see an eraser pointer enter proximity.
+        e.setIntegerValueField(.tabletProximityEventPointerType, value: eraser ? 3 : 1)
+        e.setIntegerValueField(.tabletProximityEventDeviceID, value: 1)
+        e.post(tap: .cghidEventTap)
+        penInProximity = entering
+    }
+
+    private func penPost(_ type: CGEventType, at point: CGPoint, button: CGMouseButton,
+                         pressure: Float, tiltX: Float, tiltY: Float) {
+        guard let e = CGEvent(mouseEventSource: eventSource, mouseType: type,
+                              mouseCursorPosition: point, mouseButton: button) else { return }
+        e.setIntegerValueField(.mouseEventSubtype, value: Int64(NSEvent.EventSubtype.tabletPoint.rawValue))
+        e.setDoubleValueField(.mouseEventPressure, value: Double(pressure))
+        e.setDoubleValueField(.tabletEventPointPressure, value: Double(pressure))
+        e.setDoubleValueField(.tabletEventTiltX, value: Double(max(-1, min(1, tiltX))))
+        e.setDoubleValueField(.tabletEventTiltY, value: Double(max(-1, min(1, tiltY))))
+        e.setIntegerValueField(.tabletEventDeviceID, value: 1)
+        e.post(tap: .cghidEventTap)
     }
 
     private func injectScrollEvent(deltaX: CGFloat, deltaY: CGFloat, at position: CGPoint) {

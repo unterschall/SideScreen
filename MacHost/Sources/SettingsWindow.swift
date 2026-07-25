@@ -467,6 +467,27 @@ struct SettingsView: View {
                                         .font(.system(size: 10))
                                         .foregroundColor(.orange)
                                 }
+
+                                Divider()
+
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("Pressure-Sensitive Pen")
+                                            .font(.system(size: 12, weight: .medium))
+                                        Text("Stylus pressure, tilt & eraser for drawing apps")
+                                            .font(.system(size: 10))
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    Toggle("", isOn: $settings.penEnabled)
+                                        .labelsHidden()
+                                }
+
+                                if settings.penEnabled {
+                                    Text("Reconnect the tablet after toggling for it to take effect")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.secondary)
+                                }
                             }
                         }
 
@@ -1184,6 +1205,9 @@ class DisplaySettings: ObservableObject {
     @Published var touchEnabled: Bool {
         didSet { save("touchEnabled", touchEnabled) }
     }
+    @Published var penEnabled: Bool {
+        didSet { save("penEnabled", penEnabled) }
+    }
     @Published var connectionMode: ConnectionMode {
         didSet { save("connectionMode", connectionMode.rawValue) }
     }
@@ -1231,6 +1255,7 @@ class DisplaySettings: ObservableObject {
         self.customWidth = defaults.object(forKey: keyPrefix + "customWidth") as? Int ?? 1920
         self.customHeight = defaults.object(forKey: keyPrefix + "customHeight") as? Int ?? 1200
         self.touchEnabled = defaults.object(forKey: keyPrefix + "touchEnabled") as? Bool ?? true
+        self.penEnabled = defaults.object(forKey: keyPrefix + "penEnabled") as? Bool ?? true
         let modeRaw = defaults.string(forKey: keyPrefix + "connectionMode") ?? ConnectionMode.usb.rawValue
         self.connectionMode = ConnectionMode(rawValue: modeRaw) ?? .usb
         self.autoStartStreamingOnLaunch = defaults.object(forKey: keyPrefix + "autoStartStreamingOnLaunch") as? Bool ?? false
@@ -1299,7 +1324,7 @@ class DisplaySettings: ObservableObject {
     func resetToDefaults() {
         let keys = ["resolution", "refreshRate", "hiDPI", "bitrate", "quality",
                     "gamingBoost", "port", "rotation", "flipHorizontal", "flipVertical", "showAllResolutions",
-                    "customWidth", "customHeight", "touchEnabled", "autoStartStreamingOnLaunch", "startupMode"]
+                    "customWidth", "customHeight", "touchEnabled", "penEnabled", "autoStartStreamingOnLaunch", "startupMode"]
         for key in keys {
             defaults.removeObject(forKey: keyPrefix + key)
         }
@@ -1318,6 +1343,7 @@ class DisplaySettings: ObservableObject {
         customWidth = 1920
         customHeight = 1200
         touchEnabled = true
+        penEnabled = true
         autoStartStreamingOnLaunch = false
         startupMode = .usb
 

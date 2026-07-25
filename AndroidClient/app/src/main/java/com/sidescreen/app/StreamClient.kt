@@ -38,6 +38,17 @@ class StreamClient(
     /** Invoked when the server confirms the stream codec (true = HEVC). */
     var onCodecSelected: ((Boolean) -> Unit)? = null
 
+    /** Invoked when the host advertises that pen/pressure input is enabled. */
+    var onPenEnabled: ((Boolean) -> Unit)? = null
+
+    /**
+     * True once the host has advertised pen support (type 14). The client must
+     * NOT send [sendPen] frames until this is set, or an old/pen-disabled host
+     * would misalign on the type-12 payload.
+     */
+    @Volatile var penEnabled = false
+        private set
+
     /** Stream codec for sync-frame parsing. HEVC unless the server says otherwise. */
     @Volatile var streamCodecIsHevc = true
         private set
@@ -126,8 +137,10 @@ class StreamClient(
                 outputStream = java.io.DataOutputStream(socket?.getOutputStream())
                 streamCodecIsHevc = true
                 codecNegotiated = false
+                penEnabled = false
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
+                advertisePenSupport() // Also before type 8, so the host can advertise penEnabled back in its startup finish
                 advertiseFrameMetadataSupport()
                 isConnected = true
                 lastKeyframeReceivedNs = 0L
@@ -255,8 +268,10 @@ class StreamClient(
                 outputStream = java.io.DataOutputStream(s.getOutputStream())
                 streamCodecIsHevc = true
                 codecNegotiated = false
+                penEnabled = false
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
+                advertisePenSupport() // Also before type 8, so the host can advertise penEnabled back in its startup finish
                 advertiseFrameMetadataSupport()
                 isConnected = true
                 diagLog("Wireless connected to $host:$port")
@@ -285,6 +300,14 @@ class StreamClient(
             out.writeByte(MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA)
             out.flush()
             diagLog("Advertised frame metadata support")
+        }
+    }
+
+    private fun advertisePenSupport() {
+        outputStream?.let { out ->
+            out.writeByte(MESSAGE_CLIENT_SUPPORTS_PEN)
+            out.flush()
+            diagLog("Advertised pen/stylus support")
         }
     }
 
@@ -361,6 +384,14 @@ class StreamClient(
                             onCodecSelected?.invoke(streamCodecIsHevc)
                         }
 
+                        MESSAGE_PEN_ENABLED -> {
+                            // Payload-free: host has pen input on and accepts
+                            // type-12 pen frames from us.
+                            penEnabled = true
+                            diagLog("Host enabled pen/stylus input")
+                            onPenEnabled?.invoke(true)
+                        }
+
                         else -> {
                             Log.e(
                                 TAG,
@@ -404,6 +435,46 @@ class StreamClient(
                         buffer.putFloat(y2)
                     }
                     buffer.putInt(action)
+                    out.write(buffer.array())
+                    out.flush()
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /**
+     * Send a pressure-sensitive stylus sample. No-op unless the host has
+     * advertised pen support ([penEnabled]) — otherwise the type-12 payload
+     * would misalign an old host's byte-by-byte skip of unknown types.
+     *
+     * @param flags bit0 eraser, bit1 barrel-primary, bit2 barrel-secondary
+     * @param action 0=down 1=move 2=up 3=hover-move 4=hover-enter 5=hover-exit
+     */
+    fun sendPen(
+        x: Float,
+        y: Float,
+        pressure: Float,
+        tiltX: Float,
+        tiltY: Float,
+        flags: Int,
+        action: Int,
+    ) {
+        if (!isConnected || !penEnabled) return
+
+        touchScope.launch {
+            try {
+                socket?.getOutputStream()?.let { out ->
+                    // 1 type + 1 flags + 5*4 floats + 1 action = 23 bytes.
+                    val buffer = ByteBuffer.allocate(23).order(ByteOrder.LITTLE_ENDIAN)
+                    buffer.put(MESSAGE_PEN_EVENT.toByte())
+                    buffer.put(flags.toByte())
+                    buffer.putFloat(x)
+                    buffer.putFloat(y)
+                    buffer.putFloat(pressure)
+                    buffer.putFloat(tiltX)
+                    buffer.putFloat(tiltY)
+                    buffer.put(action.toByte())
                     out.write(buffer.array())
                     out.flush()
                 }
@@ -607,6 +678,9 @@ class StreamClient(
         private const val MESSAGE_CLIENT_AVC_ONLY = 9
         private const val MESSAGE_CODEC_SELECTED = 10
         private const val MESSAGE_CLIENT_DECODER_LIMITS = 11
+        private const val MESSAGE_PEN_EVENT = 12
+        private const val MESSAGE_CLIENT_SUPPORTS_PEN = 13
+        private const val MESSAGE_PEN_ENABLED = 14
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
 

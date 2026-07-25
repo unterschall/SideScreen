@@ -21,6 +21,20 @@ private enum WireMessage {
     /// #41). Every payload byte has the high bit set, so old hosts that
     /// consume unknown types byte-by-byte skip the payload harmlessly.
     static let clientDecoderLimits: UInt8 = 11
+    /// Client→server, 22-byte payload: a pressure-sensitive stylus sample
+    /// (flags, x, y, pressure, tiltX, tiltY, action). Only ever sent AFTER the
+    /// host has advertised `penEnabled` (type 14), so old hosts — which never
+    /// send type 14 — never receive type 12 and can't misalign on its payload.
+    static let penEvent: UInt8 = 12
+    /// Client→server, payload-free: "this client can send stylus/pen events".
+    /// Sent BEFORE type 8 (like types 9/11) so it lands before the server's
+    /// protocol-startup finish. Old hosts consume the 1 byte harmlessly.
+    static let clientSupportsPen: UInt8 = 13
+    /// Server→client, payload-free: "pen input is enabled on the host". Sent
+    /// ONLY to clients that sent `clientSupportsPen` AND when the host setting
+    /// is on — old clients disconnect on unknown types, so it must never be
+    /// sent unsolicited (same convention as `codecSelected`).
+    static let penEnabled: UInt8 = 14
 }
 
 private extension NWEndpoint {
@@ -51,12 +65,25 @@ class StreamingServer {
     var onCodecNegotiated: ((StreamCodec) -> Void)?
     // Touch callback: (x1, y1, action, pointerCount, x2, y2)
     var onTouchEvent: ((Float, Float, Int, Int, Float, Float) -> Void)?
+    // Pen/stylus callback: (x, y, pressure, tiltX, tiltY, flags, action).
+    // pressure is 0...1, tiltX/tiltY are -1...1, flags is a bitfield
+    // (bit0 eraser, bit1 barrel-primary, bit2 barrel-secondary), and action is
+    // 0=down 1=move 2=up 3=hover-move 4=hover-enter 5=hover-exit.
+    var onPenEvent: ((Float, Float, Float, Float, Float, Int, Int) -> Void)?
     var onStats: ((Double, Double) -> Void)?
     var onKeyframeRequested: ((Bool) -> Void)?
     // Whether host wants to receive touch events from client. Ping/pong is
     // handled regardless. When false, incoming touch frames are dropped
     // immediately without parsing or dispatching to main queue.
     var touchEnabled: Bool = true
+    // Whether host wants pressure-sensitive pen input. Gates BOTH advertising
+    // `penEnabled` to the client (so the client won't emit pen frames) and
+    // dispatching any pen frames that still arrive.
+    var penEnabled: Bool = true
+    // Set when the connected client advertised pen capability (type 13). The
+    // host only replies with `penEnabled` (type 14) when this AND `penEnabled`
+    // (the host setting above) are both true.
+    private var clientSupportsPen = false
 
     // Wireless auth: when non-nil, non-loopback connections must present this
     // 32-byte token before being allowed to proceed. nil means wireless mode
@@ -136,6 +163,7 @@ class StreamingServer {
         connectionReady = false
         clientSupportsFrameMetadata = false
         clientIsAvcOnly = false
+        clientSupportsPen = false
         clientDecodeLimits = nil
         waitingForSyncFrame = true
         inputBuffer.removeAll(keepingCapacity: true)
@@ -199,6 +227,14 @@ class StreamingServer {
             let msg = Data([WireMessage.codecSelected, codec.wireId])
             conn.send(content: msg, completion: .contentProcessed { _ in })
             debugLog("Sent codecSelected: H.264")
+        }
+        // Pen capability handshake: only clients that opted in (type 13) can
+        // safely receive type 14, and only advertise it when the host setting
+        // is on. The client will not emit any type-12 pen frames until it sees
+        // this, keeping old/pen-disabled hosts free of unknown-type payloads.
+        if clientSupportsPen && penEnabled {
+            conn.send(content: Data([WireMessage.penEnabled]), completion: .contentProcessed { _ in })
+            debugLog("Sent penEnabled — client may send stylus events")
         }
         // Synchronous, before sendDisplaySize(): the handler switches the
         // encoder AND updates displayWidth/Height (clamped for H.264) so the
@@ -376,6 +412,33 @@ class StreamingServer {
                     handleTouchMessage(message, pointerCount: pointerCount)
                 }
 
+            case WireMessage.penEvent:
+                // Pen event: 1 type + 1 flags + 5 floats (x,y,pressure,tiltX,
+                // tiltY) + 1 action = 23 bytes fixed.
+                let expectedSize = 23
+                guard inputBuffer.count >= expectedSize else { return }
+
+                let message = Data(inputBuffer.prefix(expectedSize))
+                consumeInputBytes(expectedSize)
+
+                // Always dispatch, even if the host setting was toggled off
+                // mid-stroke: the frame may be the up/hover-exit that closes
+                // an already-open stroke, and dropping it here would strand
+                // AppDelegate's pen state (and a real synthesized mouse button
+                // left down). AppDelegate.handlePen applies the finer-grained
+                // enabled/cleanup gating.
+                handlePenMessage(message)
+
+            case WireMessage.clientSupportsPen:
+                // Payload-free opt-in (same convention as types 8/9): the
+                // client can send stylus events. Sent BEFORE type 8, so it
+                // lands before finishProtocolStartup advertises penEnabled.
+                consumeInputBytes(1)
+                if !clientSupportsPen {
+                    clientSupportsPen = true
+                    debugLog("Client supports pen/stylus input")
+                }
+
             case WireMessage.ping:
                 // Ping from client: echo back as pong (type=5) with client's timestamp.
                 guard inputBuffer.count >= 9 else { return }
@@ -460,6 +523,13 @@ class StreamingServer {
 
         DispatchQueue.main.async {
             self.onTouchEvent?(x1, y1, Int(action), pointerCount, x2, y2)
+        }
+    }
+
+    private func handlePenMessage(_ data: Data) {
+        guard let event = WirePenMessage.decode(data) else { return }
+        DispatchQueue.main.async {
+            self.onPenEvent?(event.x, event.y, event.pressure, event.tiltX, event.tiltY, Int(event.flags), Int(event.action))
         }
     }
 
